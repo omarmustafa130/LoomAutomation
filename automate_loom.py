@@ -78,7 +78,8 @@ def login_and_save_cookies():
         # We'll use a fresh persistent context in a temp directory, or you can store permanently
         temp_profile_dir = tempfile.mkdtemp()
         print(f"[LOGIN] Using profile at: {temp_profile_dir}")
-
+        progress_queue = queue.Queue()
+        progress_queue.put(("logging in.." , None))
         context = p.chromium.launch_persistent_context(
             temp_profile_dir,
             headless=False,
@@ -96,9 +97,9 @@ def login_and_save_cookies():
 
         # Wait up to a minute (or indefinite) for user login. 
         # Alternatively, show a messagebox or something to let them know:
-        time.sleep(5)
+        time.sleep(10)
         messagebox.showinfo("Login Required",
-            "Please login to Loom in the opened browser.\nClose the browser or press OK here when done."
+            "Please login to Loom in the opened browser.\npress OK here when done."
         )
 
         # Once the user is presumably logged in, extract cookies:
@@ -108,6 +109,7 @@ def login_and_save_cookies():
             json.dump(cookies, f, indent=2)
 
         context.close()
+        progress_queue.put(("Status: Logged in" , None))
         messagebox.showinfo("Login Complete", "Cookies have been saved. You can close the browser now if it's still open.")
 
 
@@ -202,29 +204,8 @@ def get_gdrive_videos(drive_service, folder_id):
     
     return valid_files
 
-def download_videos(folder_id, service_file, progress_queue):
-    credentials = service_account.Credentials.from_service_account_file(
-        service_file,
-        scopes=['https://www.googleapis.com/auth/drive.readonly']
-    )
-    drive_service = build('drive', 'v3', credentials=credentials)
-    videos = get_gdrive_videos(drive_service, folder_id)
-    total_videos = len(videos)
-    
-    for i, video in enumerate(videos):
-        progress_queue.put(("download", f"Downloading: {video['name']}", 0))
-        download_video(drive_service, video['id'], video['name'])
-        
-        # Correct progress calculation
-        progress = int(((i + 1) / total_videos) * 100)
-        progress_text = f"Downloaded {i+1} of {total_videos}"
-        progress_queue.put(("download", progress_text, progress))
-    
-    progress_queue.put(("populate_listbox", os.listdir(TEMPORARY_DOWNLOAD_DIR)))
-    save_config()
-
-# Simplified download function
-def download_video(drive_service, file_id, file_name):
+def download_video(drive_service, file_id, file_name, on_progress=None):
+    """Download a video with progress reporting."""
     file_path = os.path.join(TEMPORARY_DOWNLOAD_DIR, file_name)
     request = drive_service.files().get_media(fileId=file_id)
     with open(file_path, 'wb') as fh:
@@ -232,14 +213,52 @@ def download_video(drive_service, file_id, file_name):
         done = False
         while not done:
             status, done = downloader.next_chunk()
+            if status and on_progress:
+                # Report progress percentage for this file
+                percent = int(status.progress() * 100)
+                on_progress(percent)
     return file_path
+
+def download_videos(folder_id, service_file, progress_queue):
+    """Download each video with its own progress bar reset per video."""
+    credentials = service_account.Credentials.from_service_account_file(
+        service_file,
+        scopes=['https://www.googleapis.com/auth/drive.readonly']
+    )
+    drive_service = build('drive', 'v3', credentials=credentials)
+    videos = get_gdrive_videos(drive_service, folder_id)
+    
+    total_videos = len(videos)
+
+    for i, video in enumerate(videos):
+        # Notify start of new video download
+        progress_queue.put(("download", f"Starting download: {video['name']}", 0))
+
+        def progress_callback(percent):
+            """Update UI with per-video progress."""
+            progress_queue.put(("download", f"Downloading: {video['name']} ({percent}%)", percent))
+
+        # Download with progress tracking
+        download_video(drive_service, video['id'], video['name'], progress_callback)
+
+        # Notify completion of the video download
+        progress_queue.put(("download", f"Downloaded: {video['name']} ✔", 100))
+        time.sleep(1)  # Small delay for visual clarity
+        progress_queue.put(("download", f"", 0))  # Reset progress bar for next video
+
+    # Update UI with downloaded files
+    progress_queue.put(("populate_listbox", os.listdir(TEMPORARY_DOWNLOAD_DIR))) 
+    save_config()
+
 
 
 # Function to upload videos
 def upload_videos(progress_queue):
     save_config()
+    
     """Check if loom_cookies.json is found. If not, warn user. Otherwise proceed with headless upload."""
     files_to_upload = os.listdir(TEMPORARY_DOWNLOAD_DIR)
+    progress_queue.put(("populate_listbox", os.listdir(TEMPORARY_DOWNLOAD_DIR))) 
     if not files_to_upload:
         progress_queue.put(("complete", None))
         return
@@ -247,16 +266,16 @@ def upload_videos(progress_queue):
     # If no cookies, we can't proceed with auto login
     if not os.path.exists(LOOM_COOKIES_FILE):
         messagebox.showerror("Error", "No loom_cookies.json found. Please log in first.")
-        progress_queue.put(("complete", None))
+        progress_queue.put(("Not logged in", None))
         return
-
+    progress_queue.put(("Logging in..", None))
     # Load cookies from file
     try:
         with open(LOOM_COOKIES_FILE, "r") as f:
             stored_cookies = json.load(f)
     except Exception as e:
         messagebox.showerror("Error", f"Could not load cookies file: {e}")
-        progress_queue.put(("complete", None))
+        progress_queue.put(("Could not log in", None))
         return
 
     with sync_playwright() as p:
@@ -283,12 +302,11 @@ def upload_videos(progress_queue):
 
         page = context.new_page()
         page.evaluate("() => { delete window.navigator.webdriver; }")
-
+        progress_queue.put(("Navigtaing to workspace..", None))
         for i, filename in enumerate(files_to_upload):
             file_path = os.path.join(TEMPORARY_DOWNLOAD_DIR, filename)
-            progress_queue.put(("upload", f"Uploading video {i+1} of {len(files_to_upload)}: {filename}", 0))
             space_url = space_entry.get().strip()  # Get space name from GUI input
-
+            progress_queue.put(("Opening loom..", None))
             page.goto(space_url)
             time.sleep(5)
 
@@ -296,7 +314,7 @@ def upload_videos(progress_queue):
             add_video_button = page.wait_for_selector('button:has-text("Add video")', timeout=30000)
             add_video_button.click(force=True)
             time.sleep(1)
-
+            progress_queue.put(("Initiating upload..", None))
             # Select "Upload a video" option using the full text match
             upload_option = page.wait_for_selector('li[role="option"]:has-text("Upload a video")', timeout=30000)
             upload_option.click(force=True)
@@ -324,50 +342,54 @@ def upload_videos(progress_queue):
                     elif "Complete" in status_text:
                         progress_queue.put(("upload", f"Uploading video {i+1} of {len(files_to_upload)}: {filename}", 100))
                         break
-                    time.sleep(1)
+                    time.sleep(10)
                 except Exception as e:
                     print(f"Error tracking progress: {e}")
                     break
-            # Wait for video processing
-            page.wait_for_selector(".uppy-Dashboard-Item.is-complete", timeout=120000)
-            # Get video link
-            video_link_element = page.wait_for_selector(
-                ".uppy-Dashboard-Item.is-complete .uppy-Dashboard-Item-previewLink",
-                timeout=30000
-            )
-            video_url = video_link_element.get_attribute("href")
-            page.goto(video_url)
-            time.sleep(3)  # Let the new video appear in the list
-            # Example: find the first visible "Share" button
-            share_button = page.wait_for_selector('button[data-testid="share-modal-button"]', timeout=30000)
-            share_button.click()
-            time.sleep(2)
-            dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
+            progress_queue.put(("Finished uploading video, Extracting data..", None))
+            try:
+                # Wait for video processing
+                page.wait_for_selector(".uppy-Dashboard-Item.is-complete", timeout=120000)
+                # Get video link
+                video_link_element = page.wait_for_selector(
+                    ".uppy-Dashboard-Item.is-complete .uppy-Dashboard-Item-previewLink",
+                    timeout=30000
+                )
+                video_url = video_link_element.get_attribute("href")
+                page.goto(video_url)
+                time.sleep(10)  # Let the new video appear in the list
+        
+                share_button = page.wait_for_selector('button[data-testid="share-modal-button"]', timeout=30000)
+                share_button.click()
+                time.sleep(10)
+                dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
 
-            dialog.hover()
-            dialog.locator("button.menu_shareTab_3H-", has_text="Embed").hover()
-            dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
+                dialog.hover()
+                dialog.locator("button.menu_shareTab_3H-", has_text="Embed").hover()
+                dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()    
 
-            # 3) Wait for the thumbnail to appear under the "Embed" section
-            thumbnail = page.wait_for_selector('img[alt="Video thumbnail"]', timeout=15000)
-            thumbnail_src = thumbnail.get_attribute('src')
-            print("Thumbnail src:", thumbnail_src)
+                # 3) Wait for the thumbnail to appear under the "Embed" section
+                thumbnail = page.wait_for_selector('img[alt="Video thumbnail"]', timeout=90000)
+                thumbnail_src = thumbnail.get_attribute('src')
+                print("Thumbnail src:", thumbnail_src)
 
-            # -------------------------
-            # OPTION A: Use Loom’s “Copy embed code” button (if available) 
-            #           and read from clipboard
-            # -------------------------
-            copy_embed_btn = page.wait_for_selector('button.css-ask8uh:has-text("Copy embed code")', timeout=5000)
-            copy_embed_btn.click()
+                # -------------------------
+                # OPTION A: Use Loom’s “Copy embed code” button (if available) 
+                #           and read from clipboard
+                # -------------------------
+                copy_embed_btn = page.wait_for_selector('button.css-ask8uh:has-text("Copy embed code")', timeout=5000)
+                copy_embed_btn.click()
 
-            # read from the clipboard:
-            embed_code = page.evaluate("navigator.clipboard.readText()")
-            print("Embed Code from button:\n", embed_code)
+                # read from the clipboard:
+                embed_code = page.evaluate("navigator.clipboard.readText()")
+                print("Embed Code from button:\n", embed_code)
 
-            # Append to Excel and update GUI
-            append_to_excel(filename, video_url, embed_code)
-            progress_queue.put(("add_video", filename, video_url, "Added to the Excel sheet"))
-
+                # Append to Excel and update GUI
+                append_to_excel(filename, video_url, embed_code)
+                progress_queue.put(("add_video", filename, video_url, "Added to the Excel sheet"))
+            except:
+                append_to_excel(filename, video_url, "Could not extract")
+                progress_queue.put(("Uploaded video but couldn't extract data", None))
             # Clean up
             os.remove(file_path)
         progress_queue.put(("complete", None))
@@ -448,6 +470,7 @@ def check_progress_queue(progress_queue):
             if item[0] == "complete":
                 messagebox.showinfo("Complete", "Operation finished")
                 progress_bar['value'] = 0
+                progress_label.config(text="Upload Complete")
                 
             elif item[0] == "populate_listbox":
                 upload_listbox.delete(0, tk.END)
@@ -458,19 +481,23 @@ def check_progress_queue(progress_queue):
             elif item[0] == "add_video":
                 # item = ("add_video", filename, video_url, "Added to the Excel sheet")
                 tree.insert("", "end", values=(item[1], item[2], item[3]))
-
-
                 
             elif item[0] in ("download", "upload"):
                 _, text, value = item
-                progress_label.config(text=text)
+                progress_label.config(text=f"{text} ({value}%)")  # Append percentage
                 progress_bar['value'] = value
-                
+            
+            # **New Condition: Handle General Messages**
+            elif isinstance(item[0], str):
+                progress_label.config(text=item[0])
+
             root.update_idletasks()
             
     except queue.Empty:
         pass
     root.after(100, lambda: check_progress_queue(progress_queue))
+
+
 
 
 
