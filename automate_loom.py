@@ -13,26 +13,26 @@ import queue
 import json
 from pathlib import Path
 import sys
-# Add this after TEMPORARY_DOWNLOAD_DIR definition
+import shutil
+
+
+
+PAUSE_FLAG = False
+
+# Configuration constants
 CONFIG_FILE = "loom_config.json"
 LOOM_COOKIES_FILE = "loom_cookies.json"
-
-# Define temporary download directory
 TEMPORARY_DOWNLOAD_DIR = 'downloaded_videos'
 os.makedirs(TEMPORARY_DOWNLOAD_DIR, exist_ok=True)
 
+# Set browser path for frozen executable
 if getattr(sys, 'frozen', False):
-    # When running as a frozen executable, set the browsers path to the bundled "browsers" folder
     exe_path = os.path.dirname(sys.executable)
     os.environ['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(exe_path, 'browsers')
 
-# Add this function to handle config saving/loading
+# Helper functions
 def load_config():
-    config = {
-        'folder_id': '',
-        'service_file': '',
-        'space': ''  # Default space name
-    }
+    config = {'folder_id': '', 'service_file': '', 'space': ''}
     try:
         if Path(CONFIG_FILE).exists():
             with open(CONFIG_FILE, 'r') as f:
@@ -68,7 +68,19 @@ def append_to_excel(video_title, video_url, embed_code):
     ws.append([video_title, video_url, embed_code])
     wb.save(file_name)
 
-
+def update_excel_embed_code(video_url, new_embed_code):
+    file_name = "uploaded_videos.xlsx"
+    try:
+        wb = load_workbook(file_name)
+        ws = wb["Videos"]
+        for row in ws.iter_rows(min_row=2):
+            if row[1].value == video_url:
+                row[2].value = new_embed_code
+        wb.save(file_name)
+        return True
+    except Exception as e:
+        print(f"Error updating Excel: {e}")
+        return False
 
 
 
@@ -138,6 +150,158 @@ def logout():
     space_entry.delete(0, tk.END)
 
     messagebox.showinfo("Logged Out", "Cookies and config file have been removed.")
+
+
+
+
+# Video processing functions
+def extract_embed_code(page, progress_queue, title):
+    try:
+        page.wait_for_selector('button[data-testid="share-modal-button"]', timeout=60000).click()
+        time.sleep(5)
+        dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
+        dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
+        
+        try:
+            page.wait_for_selector('img[alt="Video thumbnail"]', timeout=90000)
+        except:
+            dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
+            dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
+        copy_btn = page.wait_for_selector('button.css-ask8uh:has-text("Copy embed code")', timeout=60000)
+        copy_btn.click()
+        embed_code = page.evaluate("navigator.clipboard.readText()")
+        progress_queue.put(("embed_success", title, page.url, embed_code))
+        return embed_code
+    except Exception as e:
+        progress_queue.put(("embed_error", page.url, str(e)))
+        return None
+    
+
+
+def process_video_url(url, progress_queue, title):
+    if not os.path.exists(LOOM_COOKIES_FILE):
+        return None
+
+    with open(LOOM_COOKIES_FILE, "r") as f:
+        stored_cookies = json.load(f)
+        
+    with sync_playwright() as p:
+        temp_profile_dir = tempfile.mkdtemp()
+        context = p.chromium.launch_persistent_context(
+            temp_profile_dir,
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            ]
+        )
+        context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://www.loom.com")
+        context.add_cookies(stored_cookies)
+
+        page = context.new_page()
+        try:
+            page.goto(url)
+            # Possibly track how long it's taking...
+            # You can add your own "stuck" logic similarly.
+
+            time.sleep(5)
+            embed_code = extract_embed_code(page, progress_queue, title)
+            return embed_code
+        except Exception as e:
+            progress_queue.put(("embed_error", url, str(e)))
+            return None
+        finally:
+            context.close()
+            shutil.rmtree(temp_profile_dir, ignore_errors=True)
+
+
+def generate_embed_codes(progress_queue):
+    max_retries = 3  # how many times to retry extracting an embed code
+
+    try:
+        wb = load_workbook("uploaded_videos.xlsx")
+        ws = wb["Videos"]
+
+        # 1) Identify which rows need embed codes, and collect Title & URL
+        rows_to_process = []
+        for row in ws.iter_rows(min_row=2):
+            # row[0] = Title, row[1] = URL, row[2] = Embed Code
+            title = row[0].value or ""
+            url   = row[1].value or ""
+            code  = row[2].value or ""
+            if not code or "Couldn't Extract" in code:
+                # We want to try extracting a code for these
+                rows_to_process.append((title, url))
+
+        # If none need extraction, we can simply signal done:
+        if not rows_to_process:
+            progress_queue.put(("complete", "All embed codes already present"))
+            return
+
+        # 2) Let GUI know how many we'll process
+        progress_queue.put(("total_embeds", len(rows_to_process)))
+
+        # 3) For each row needing code, do the extraction
+        for i, (title, url) in enumerate(rows_to_process, start=1):
+            progress_queue.put(("current_embed", i, url))
+
+            attempts_left = max_retries
+            embed_code = None
+
+            while attempts_left > 0:
+                try:
+                    embed_code = process_video_url(url, progress_queue, title)
+                    if embed_code:
+                        # Success
+                        break
+                except Exception as e:
+                    print(f"Embed extraction error for {url}: {e}")
+                attempts_left -= 1
+                if attempts_left > 0:
+                    print(f"Retrying embed extraction for {url}...")
+
+            # 4) Update Excel with final result: success or fail
+            if embed_code:
+                update_excel_embed_code(url, embed_code)
+            else:
+                embed_code = "Couldn't Extract - Retry Failed"
+                update_excel_embed_code(url, embed_code)
+
+
+
+    except Exception as e:
+        progress_queue.put(("embed_error", "General Error", str(e)))
+    finally:
+        # 6) Signal done
+        progress_queue.put(("complete", "Embed code generation completed"))
+
+
+
+# GUI functions
+def start_generate_embeds():
+    if not os.path.exists("uploaded_videos.xlsx"):
+        messagebox.showerror("Error", "No Excel file found")
+        return
+        
+    # Create our progress queue for communication
+    progress_queue = queue.Queue()
+
+    # 1) Clear the TreeView right away
+    progress_queue.put(("clear_tree", None))
+
+    # 2) Launch thread to do the embed extraction
+    threading.Thread(target=generate_embed_codes, args=(progress_queue,)).start()
+
+    # 3) Keep checking queue
+    root.after(100, lambda: check_progress_queue(progress_queue))
+
+
+def pause_upload():
+    global PAUSE_FLAG
+    PAUSE_FLAG = True
+    messagebox.showinfo("Paused", "Upload process will paused now")
 
 def start_download_and_upload():
     """Download all videos, then immediately upload them (in one go)."""
@@ -219,6 +383,12 @@ def download_video(drive_service, file_id, file_name, on_progress=None):
                 on_progress(percent)
     return file_path
 
+def pause_upload():
+    global PAUSE_FLAG
+    PAUSE_FLAG = True
+    messagebox.showinfo("Paused", "Upload process will pause now")
+
+
 def download_videos(folder_id, service_file, progress_queue):
     """Download each video with its own progress bar reset per video."""
     credentials = service_account.Credentials.from_service_account_file(
@@ -251,25 +421,29 @@ def download_videos(folder_id, service_file, progress_queue):
     save_config()
 
 
-
-# Function to upload videos
 def upload_videos(progress_queue):
+    global PAUSE_FLAG
+    PAUSE_FLAG = False  # reset each time
+
+    # --- You can tune these values as you like ---
+    max_retries = 3             # How many times to retry a file if stuck
+    upload_timeout_seconds = 180  # If no progress for this many seconds, consider it stuck
+    time_between_checks = 5       # How often to check progress (seconds)
+
     save_config()
-    
-    """Check if loom_cookies.json is found. If not, warn user. Otherwise proceed with headless upload."""
     files_to_upload = os.listdir(TEMPORARY_DOWNLOAD_DIR)
-    progress_queue.put(("populate_listbox", os.listdir(TEMPORARY_DOWNLOAD_DIR))) 
+    progress_queue.put(("populate_listbox", files_to_upload))
+
     if not files_to_upload:
         progress_queue.put(("complete", None))
         return
     
-    # If no cookies, we can't proceed with auto login
     if not os.path.exists(LOOM_COOKIES_FILE):
         messagebox.showerror("Error", "No loom_cookies.json found. Please log in first.")
         progress_queue.put(("Not logged in", None))
         return
+
     progress_queue.put(("Logging in..", None))
-    # Load cookies from file
     try:
         with open(LOOM_COOKIES_FILE, "r") as f:
             stored_cookies = json.load(f)
@@ -279,120 +453,192 @@ def upload_videos(progress_queue):
         return
 
     with sync_playwright() as p:
-        temp_profile_dir = tempfile.mkdtemp()
-        print(f"Using temporary profile at: {temp_profile_dir}")
-        # HEADLESS (or not)
-        context = p.chromium.launch_persistent_context(
-            temp_profile_dir,
-            headless=True,
-            viewport={"width": 1280, "height": 720},
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-infobars",
-                "--window-size=1280,720",
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ]
-        )
+        # We'll iterate over the files by index so we can remove or retry them
+        i = 0
+        while i < len(files_to_upload):
+            filename = files_to_upload[i]
 
-        # Add cookies before creating the page
-        context.add_cookies(stored_cookies)
-        context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://www.loom.com")
+            if PAUSE_FLAG:
+                # user pressed "Pause"
+                progress_queue.put(("pausing", None))
+                break
 
-        page = context.new_page()
-        page.evaluate("() => { delete window.navigator.webdriver; }")
-        progress_queue.put(("Navigtaing to workspace..", None))
-        for i, filename in enumerate(files_to_upload):
             file_path = os.path.join(TEMPORARY_DOWNLOAD_DIR, filename)
-            space_url = space_entry.get().strip()  # Get space name from GUI input
-            progress_queue.put(("Opening loom..", None))
-            page.goto(space_url)
-            time.sleep(5)
+            if not os.path.isfile(file_path):
+                # If file was missing or already removed, skip it
+                i += 1
+                continue
 
-            # Click "New video"
-            add_video_button = page.wait_for_selector('button:has-text("Add video")', timeout=30000)
-            add_video_button.click(force=True)
-            time.sleep(1)
-            progress_queue.put(("Initiating upload..", None))
-            # Select "Upload a video" option using the full text match
-            upload_option = page.wait_for_selector('li[role="option"]:has-text("Upload a video")', timeout=30000)
-            upload_option.click(force=True)
-            time.sleep(1)
-            # Upload video
-            with page.expect_file_chooser() as fc_info:
-                page.keyboard.press(" ")
-            file_chooser = fc_info.value
-            file_chooser.set_files(file_path)
-            # Wait for upload UI and start upload
-            page.wait_for_selector("text=Upload 1 file", timeout=60000)
-            upload_button = page.wait_for_selector("button.uppy-StatusBar-actionBtn--upload", timeout=60000)
-            upload_button.click(force=True)
-            # Track upload progress
-            previous_percentage = 0
-            while True:
+            # Optional: get local file size (for approximate MB/s)
+            file_size = os.path.getsize(file_path)
+
+            attempts_left = max_retries
+            success = False
+
+            while attempts_left > 0 and not success:
+                temp_profile_dir = tempfile.mkdtemp()
                 try:
-                    status_element = page.wait_for_selector(".uppy-StatusBar-statusPrimary", timeout=30000)
-                    status_text = status_element.inner_text().strip()
-                    if "Uploading: " in status_text:
-                        current_percentage = int(status_text.split(": ")[1].replace("%", ""))
-                        if current_percentage != previous_percentage:
-                            previous_percentage = current_percentage
-                            progress_queue.put(("upload", f"Uploading video {i+1} of {len(files_to_upload)}: {filename}", current_percentage))
-                    elif "Complete" in status_text:
-                        progress_queue.put(("upload", f"Uploading video {i+1} of {len(files_to_upload)}: {filename}", 100))
-                        break
-                    time.sleep(10)
+                    context = p.chromium.launch_persistent_context(
+                        temp_profile_dir,
+                        headless=True,
+                        viewport={"width": 1280, "height": 720},
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-infobars",
+                            "--window-size=1280,720",
+                            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                        ]
+                    )
+                    context.add_cookies(stored_cookies)
+                    context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://www.loom.com")
+
+                    page = context.new_page()
+                    page.evaluate("() => { delete window.navigator.webdriver; }")
+
+                    # Notify UI
+                    progress_queue.put(("upload", f"Opening Loom workspace for {filename}...", 0))
+
+                    space_url = space_entry.get().strip()
+                    page.goto(space_url)
+                    time.sleep(8)
+
+                    add_video_button = page.wait_for_selector('button:has-text("Add video")', timeout=60000)
+                    add_video_button.click(force=True)
+                    time.sleep(3)
+                    progress_queue.put(("upload", "Initiating upload...", 0))
+
+                    upload_option = page.wait_for_selector('li[role="option"]:has-text("Upload a video")', timeout=60000)
+                    upload_option.click(force=True)
+                    time.sleep(3)
+
+                    # File chooser
+                    with page.expect_file_chooser() as fc_info:
+                        page.keyboard.press(" ")
+                    file_chooser = fc_info.value
+                    file_chooser.set_files(file_path)
+
+                    page.wait_for_selector("text=Upload 1 file", timeout=60000)
+                    upload_button = page.wait_for_selector("button.uppy-StatusBar-actionBtn--upload", timeout=60000)
+                    upload_button.click(force=True)
+
+                    previous_percentage = 0
+                    previous_time = time.time()  # for speed calc
+                    last_progress_update = time.time()
+
+                    # -- Track upload progress with a loop + timeout check --
+                    while True:
+                        if PAUSE_FLAG:
+                            # user pressed pause mid-upload
+                            context.close()
+                            shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                            progress_queue.put(("pausing", None))
+                            return
+
+                        status_element = page.wait_for_selector(".uppy-StatusBar-statusPrimary", timeout=60000)
+                        status_text = status_element.inner_text().strip()
+
+                        if "Uploading: " in status_text:
+                            # "Uploading: 97%"
+                            current_percentage = int(status_text.split(": ")[1].replace("%", ""))
+
+                            if current_percentage != previous_percentage:
+                                # Update "last progress" time
+                                now = time.time()
+                                stuck_duration = now - last_progress_update
+                                last_progress_update = now
+
+                                # --- Approx upload speed calc (MB/s) ---
+                                delta_percent = current_percentage - previous_percentage
+                                bytes_uploaded_now = (delta_percent / 100.0) * file_size
+                                delta_time = now - previous_time
+                                # Avoid divide-by-zero
+                                if delta_time < 0.1:
+                                    delta_time = 0.1
+                                speed_mbs = (bytes_uploaded_now / 1_000_000) / delta_time
+
+                                previous_percentage = current_percentage
+                                previous_time = now
+
+                                # Send progress to UI
+                                progress_queue.put((
+                                    "upload",
+                                    f"Uploading {filename}: {current_percentage}% "
+                                    f"({speed_mbs:.2f} MB/s)",
+                                    current_percentage
+                                ))
+
+                            # Check if stuck too long
+                            if (time.time() - last_progress_update) > upload_timeout_seconds:
+                                raise TimeoutError(f"Stuck uploading {filename} for too long.")
+
+                        elif "Complete" in status_text:
+                            progress_queue.put(("upload", f"{filename}: 100% Complete", 100))
+                            break
+
+                        time.sleep(time_between_checks)
+
+                    # If we get here, presumably the upload completed
+                    progress_queue.put(("upload", "Finished uploading. Extracting URL..", 0))
+
+                    # Wait for processing
+                    page.wait_for_selector(".uppy-Dashboard-Item.is-complete", timeout=120000)
+                    video_link_element = page.wait_for_selector(
+                        ".uppy-Dashboard-Item.is-complete .uppy-Dashboard-Item-previewLink",
+                        timeout=30000
+                    )
+                    video_url = video_link_element.get_attribute("href")
+
+                    append_to_excel(filename, video_url, "")
+                    progress_queue.put(("add_video", filename, video_url, ""))
+
+                    # Remove file from disk
+                    os.remove(file_path)
+                    progress_queue.put(("remove_file", filename))
+
+                    context.close()
+                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
+
+                    success = True  # break from retry loop
+
+                except TimeoutError as toe:
+                    # If we timed out, let's close and retry
+                    context.close()
+                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                    attempts_left -= 1
+                    print(f"TimeoutError for {filename}: {toe}. Retrying...")
+
+                    if attempts_left == 0:
+                        # Give up
+                        messagebox.showerror(
+                            "Upload Stuck", 
+                            f"{filename} got stuck too many times. Skipping this file."
+                        )
+                        # Optionally log in Excel as "Failed"
+                        append_to_excel(filename, "Upload Stuck", "Could not complete upload")
+                        progress_queue.put(("remove_file", filename))
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                
                 except Exception as e:
-                    print(f"Error tracking progress: {e}")
-                    break
-            progress_queue.put(("Finished uploading video, Extracting data..", None))
-            try:
-                # Wait for video processing
-                page.wait_for_selector(".uppy-Dashboard-Item.is-complete", timeout=120000)
-                # Get video link
-                video_link_element = page.wait_for_selector(
-                    ".uppy-Dashboard-Item.is-complete .uppy-Dashboard-Item-previewLink",
-                    timeout=30000
-                )
-                video_url = video_link_element.get_attribute("href")
-                page.goto(video_url)
-                time.sleep(10)  # Let the new video appear in the list
-        
-                share_button = page.wait_for_selector('button[data-testid="share-modal-button"]', timeout=30000)
-                share_button.click()
-                time.sleep(10)
-                dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
+                    # Some other error
+                    print(f"Error uploading {filename}: {e}")
+                    context.close()
+                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                    # We can choose to break or retry. Let's break:
+                    attempts_left = 0  
+                    append_to_excel(filename, "Unknown", f"Upload error: {e}")
+                    progress_queue.put(("remove_file", filename))
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
 
-                dialog.hover()
-                dialog.locator("button.menu_shareTab_3H-", has_text="Embed").hover()
-                dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()    
+            i += 1  # move to next file
 
-                # 3) Wait for the thumbnail to appear under the "Embed" section
-                thumbnail = page.wait_for_selector('img[alt="Video thumbnail"]', timeout=90000)
-                thumbnail_src = thumbnail.get_attribute('src')
-                print("Thumbnail src:", thumbnail_src)
-
-                # -------------------------
-                # OPTION A: Use Loom’s “Copy embed code” button (if available) 
-                #           and read from clipboard
-                # -------------------------
-                copy_embed_btn = page.wait_for_selector('button.css-ask8uh:has-text("Copy embed code")', timeout=5000)
-                copy_embed_btn.click()
-
-                # read from the clipboard:
-                embed_code = page.evaluate("navigator.clipboard.readText()")
-                print("Embed Code from button:\n", embed_code)
-
-                # Append to Excel and update GUI
-                append_to_excel(filename, video_url, embed_code)
-                progress_queue.put(("add_video", filename, video_url, "Added to the Excel sheet"))
-            except:
-                append_to_excel(filename, video_url, "Could not extract")
-                progress_queue.put(("Uploaded video but couldn't extract data", None))
-            # Clean up
-            os.remove(file_path)
+        # Finished all files
         progress_queue.put(("complete", None))
+
+
 
 
 # Browse button for service file
@@ -461,38 +707,65 @@ def start_upload():
     upload_thread.start()
     root.after(100, lambda: check_progress_queue(progress_queue))
 
-# Update the check_progress_queue function
 def check_progress_queue(progress_queue):
     try:
         while True:
             item = progress_queue.get_nowait()
-            
-            if item[0] == "complete":
-                messagebox.showinfo("Complete", "Operation finished")
-                progress_bar['value'] = 0
-                progress_label.config(text="Upload Complete")
-                
-            elif item[0] == "populate_listbox":
+            if item[0] == "populate_listbox":
                 upload_listbox.delete(0, tk.END)
-                for filename in item[1]:
-                    upload_listbox.insert(tk.END, filename)
-                progress_label.config(text="Download complete")
-                
+                for fname in item[1]:
+                    upload_listbox.insert(tk.END, fname)
+
             elif item[0] == "add_video":
-                # item = ("add_video", filename, video_url, "Added to the Excel sheet")
                 tree.insert("", "end", values=(item[1], item[2], item[3]))
-                
+
             elif item[0] in ("download", "upload"):
                 _, text, value = item
-                progress_label.config(text=f"{text} ({value}%)")  # Append percentage
+                progress_label.config(text=f"{text} ({value}%)")
                 progress_bar['value'] = value
-            
-            # **New Condition: Handle General Messages**
-            elif isinstance(item[0], str):
-                progress_label.config(text=item[0])
 
+            elif item[0] == "remove_file":
+                # Remove the file from the listbox
+                filename = item[1]
+                all_items = upload_listbox.get(0, tk.END)
+                if filename in all_items:
+                    idx = all_items.index(filename)
+                    upload_listbox.delete(idx)
+
+            elif item[0] == "complete":
+                # If there's a message, show it; otherwise use default
+                msg = item[1] if item[1] else "Operation Complete"
+                messagebox.showinfo("Complete", msg)
+                progress_bar['value'] = 0
+                progress_label.config(text="Operation Complete")
+
+            elif item[0] == "total_embeds":
+                progress_bar['maximum'] = item[1]
+
+            elif item[0] == "current_embed":
+                progress_label.config(text=f"Processing {item[1]}/{progress_bar['maximum']}: {item[2]}")
+                progress_bar['value'] = item[1]
+            elif item[0] == "clear_tree":
+                # remove all rows from the "Uploaded Videos" tree
+                for row_id in tree.get_children():
+                    tree.delete(row_id)
+
+            elif item[0] == "embed_success":
+                title = item[1]
+                url   = item[2]
+                code  = item[3]
+                tree.insert("", "end", values=(title, url, code))
+
+
+            elif item[0] == "embed_error":
+                messagebox.showerror("Error", f"Failed to process {item[1]}: {item[2]}")
+
+            elif item[0] == "pausing":
+                progress_label.config(text="Upload paused")
+                progress_bar['value'] = 0
+                messagebox.showinfo("Paused", "Upload has been paused.")
+                
             root.update_idletasks()
-            
     except queue.Empty:
         pass
     root.after(100, lambda: check_progress_queue(progress_queue))
@@ -500,101 +773,81 @@ def check_progress_queue(progress_queue):
 
 
 
-
-# GUI Setup
 root = tk.Tk()
 root.title("Loom Video Uploader")
-root.geometry("620x600")
-root.configure(bg='#f0f0f0')  # Main background color
+root.geometry("850x650")  # Wider window
+root.configure(bg='#f0f0f0')
 root.resizable(False, False)
-# Configure styles with unified background
+
+# Style configuration
 style = ttk.Style()
 style.theme_use('clam')
-
-# Configure all elements to use the same background
 style.configure(".", background='#f0f0f0', foreground='black')
 style.configure("TButton", background='#e1e1e1')
 style.configure("Horizontal.TProgressbar", background="green", troughcolor='#d0d0d0')
 style.configure("Treeview", background='white', fieldbackground='white')
 style.map("Treeview", background=[('selected', '#347083')])
 
-# Frame styling
-style.configure("TFrame", background='#f0f0f0')
-
-# Folder ID input frame
+# Frames
 input_frame = ttk.Frame(root, padding=10)
 input_frame.pack(pady=5, fill='x')
 
-# Load existing config
+# Load config
 config = load_config()
 
-# Folder ID
-folder_id_label = ttk.Label(input_frame, text="Google Drive Folder ID:")
-folder_id_label.grid(row=0, column=0, padx=5, sticky='w')
-folder_id_entry = ttk.Entry(input_frame, width=50)
+# Input fields
+ttk.Label(input_frame, text="Google Drive Folder ID:").grid(row=0, column=0, padx=5, sticky='w')
+folder_id_entry = ttk.Entry(input_frame, width=60)
 folder_id_entry.insert(0, config['folder_id'])
 folder_id_entry.grid(row=0, column=1, padx=5, sticky='ew')
 
-# Service File
-service_file_label = ttk.Label(input_frame, text="Service Account JSON File:")
-service_file_label.grid(row=1, column=0, padx=5, sticky='w')
-service_file_entry = ttk.Entry(input_frame, width=50)
+ttk.Label(input_frame, text="Service Account JSON File:").grid(row=1, column=0, padx=5, sticky='w')
+service_file_entry = ttk.Entry(input_frame, width=60)
 service_file_entry.insert(0, config['service_file'])
 service_file_entry.grid(row=1, column=1, padx=5, sticky='ew')
 
-# Space
-space_label = ttk.Label(input_frame, text="Space URL:")
-space_label.grid(row=2, column=0, padx=5, sticky='w')
-space_entry = ttk.Entry(input_frame, width=50)
+ttk.Label(input_frame, text="Space URL:").grid(row=2, column=0, padx=5, sticky='w')
+space_entry = ttk.Entry(input_frame, width=90)
 space_entry.insert(0, config['space'])
 space_entry.grid(row=2, column=1, padx=5, sticky='ew')
 
-# Browse button remains the same
 browse_button = ttk.Button(input_frame, text="Browse", command=browse_file)
 browse_button.grid(row=1, column=2, padx=5)
 
-# Modify the upload_videos function
-# Replace the space_selector line with:
-space_name = space_entry.get()
-space_selector = f'span.navigation_linkTitle_253:has-text("{space_name}")'
+# Existing buttons
+button_frame = ttk.Frame(root)
+button_frame.pack(pady=5)
 
-# Add save on exit
-root.protocol("WM_DELETE_WINDOW", lambda: [save_config(), root.destroy()])
-
-# Button container
-button_frame = ttk.Frame(root, padding=10)
-button_frame.pack(pady=5, fill='x')
-
-# <--- HERE: add the new "Login" button
 login_button = ttk.Button(button_frame, text="Login", command=start_login)
-login_button.pack(side='left', padx=5)
-# Add the new logout button
 logout_button = ttk.Button(button_frame, text="Logout", command=logout)
-logout_button.pack(side='left', padx=5)
 download_button = ttk.Button(button_frame, text="Download", command=start_download)
-download_button.pack(side='left', padx=5)
 download_upload_button = ttk.Button(button_frame, text="Download & Upload", command=start_download_and_upload)
-download_upload_button.pack(side='left', padx=5)
-upload_buttons_frame = ttk.Frame(button_frame)
-upload_buttons_frame.pack(side='right', padx=5)
+rename_button = ttk.Button(button_frame, text="Rename", command=rename_selected)
+upload_button = ttk.Button(button_frame, text="Upload", command=start_upload)
+pause_button = ttk.Button(button_frame, text="Pause", command=pause_upload)
+generate_button = ttk.Button(button_frame, text="Generate Embeds", command=start_generate_embeds)
 
-rename_button = ttk.Button(upload_buttons_frame, text="Rename Selected", command=rename_selected)
-rename_button.pack(side='left', padx=5)
+buttons = [login_button, logout_button, download_button, download_upload_button, rename_button, upload_button, pause_button, generate_button]
+for btn in buttons:
+    btn.pack(side='left', padx=5)
 
-upload_button = ttk.Button(upload_buttons_frame, text="Upload", command=start_upload)
-upload_button.pack(side='left', padx=5)
-
-# Upload list frame
+# List and progress elements remain the same
 list_frame = ttk.Frame(root, padding=10)
 list_frame.pack(pady=5, fill='both', expand=True)
 
 upload_label = ttk.Label(list_frame, text="Videos to Upload")
 upload_label.pack(anchor='w')
 
-upload_listbox = tk.Listbox(list_frame, selectmode="single", bg='white')
-upload_listbox.pack(fill='both', expand=True)
+list_container = ttk.Frame(list_frame)
+list_container.pack(fill='both', expand=True)
 
-# Progress indicators
+scrollbar = ttk.Scrollbar(list_container)
+upload_listbox = tk.Listbox(list_container, selectmode="single", bg='white', yscrollcommand=scrollbar.set)
+scrollbar.config(command=upload_listbox.yview)
+upload_listbox.pack(side='left', fill='both', expand=True)
+scrollbar.pack(side='right', fill='y')
+
+# Progress elements
 progress_frame = ttk.Frame(root, padding=10)
 progress_frame.pack(pady=5, fill='x')
 
@@ -604,21 +857,25 @@ progress_label.pack(anchor='w')
 progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", length=300, mode="determinate")
 progress_bar.pack(fill='x')
 
-# Uploaded videos list
+# Uploaded videos treeview
 uploaded_frame = ttk.Frame(root, padding=10)
 uploaded_frame.pack(pady=5, fill='both', expand=True)
 
-uploaded_videos_label = ttk.Label(uploaded_frame, text="Uploaded Videos")
-uploaded_videos_label.pack(anchor='w')
+ttk.Label(uploaded_frame, text="Uploaded Videos").pack(anchor='w')
 
-tree = ttk.Treeview(uploaded_frame, columns=("Title", "URL", "Embed Code"), show="headings", selectmode="none")
+tree_container = ttk.Frame(uploaded_frame)
+tree_container.pack(fill='both', expand=True)
+
+tree_scroll = ttk.Scrollbar(tree_container)
+tree = ttk.Treeview(tree_container, columns=("Title", "URL", "Embed Code"), show="headings", yscrollcommand=tree_scroll.set)
 tree.heading("Title", text="Video Title")
 tree.heading("URL", text="URL")
 tree.heading("Embed Code", text="Embed Code")
-tree.column("Title", width=150)
-tree.column("URL", width=250)
-tree.column("Embed Code", width=200)
-tree.pack(fill='both', expand=True)
+tree.column("Title", width=200)
+tree.column("URL", width=300)
+tree.column("Embed Code", width=250)
+tree.pack(side='left', fill='both', expand=True)
+tree_scroll.pack(side='right', fill='y')
 
-# Run the GUI
+root.protocol("WM_DELETE_WINDOW", lambda: [save_config(), root.destroy()])
 root.mainloop()
