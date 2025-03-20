@@ -239,11 +239,23 @@ def sync_videos(progress_queue):
             page.goto(space_url)
             page.wait_for_selector('article[data-videoid]', timeout=30000)
 
-            # Scroll to load all videos
-            for _ in range(5):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(1)
+            prev_count = 0
+            max_consecutive_no_new = 4
+            consecutive_no_new = 0
 
+            while consecutive_no_new < max_consecutive_no_new:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(6)  # Wait for content to load
+                current_videos = page.query_selector_all('article[data-videoid]')
+                current_count = len(current_videos)
+                progress_queue.put(("status", f"Loaded {current_count} videos..."))
+                if current_count > prev_count:
+                    prev_count = current_count
+                    consecutive_no_new = 0  # Reset if new videos are found
+                else:
+                    consecutive_no_new += 1  # Increment if no new videos
+
+            # After scrolling, get all videos
             videos = page.query_selector_all('article[data-videoid]')
             progress_queue.put(("status", f"Found {len(videos)} videos in space"))
 
