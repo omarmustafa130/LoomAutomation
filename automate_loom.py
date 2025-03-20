@@ -205,7 +205,77 @@ def process_video_url(url, progress_queue, title):
             context.close()
             shutil.rmtree(temp_profile_dir, ignore_errors=True)
 
+def sync_videos(progress_queue):
+    progress_queue.put(("status", "Starting video synchronization..."))
+    if not os.path.exists(LOOM_COOKIES_FILE):
+        progress_queue.put(("error", "No cookies found. Please login first."))
+        return
 
+    space_url = space_entry.get().strip()
+    if not space_url:
+        progress_queue.put(("error", "Please provide a Space URL"))
+        return
+
+    with open(LOOM_COOKIES_FILE, "r") as f:
+        stored_cookies = json.load(f)
+
+    with sync_playwright() as p:
+        temp_profile_dir = tempfile.mkdtemp()
+        context = p.chromium.launch_persistent_context(
+            temp_profile_dir,
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            ]
+        )
+        context.add_cookies(stored_cookies)
+        page = context.new_page()
+
+        try:
+            progress_queue.put(("status", "Loading Loom space content..."))
+            page.goto(space_url)
+            page.wait_for_selector('article[data-videoid]', timeout=30000)
+
+            # Scroll to load all videos
+            for _ in range(5):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(1)
+
+            videos = page.query_selector_all('article[data-videoid]')
+            progress_queue.put(("status", f"Found {len(videos)} videos in space"))
+
+            existing_urls = set()
+            if os.path.exists("uploaded_videos.xlsx"):
+                wb = load_workbook("uploaded_videos.xlsx")
+                ws = wb.active
+                existing_urls = {row[1].value for row in ws.iter_rows(min_row=2)}
+
+            new_entries = 0
+            for i, video in enumerate(videos, 1):
+                link = video.query_selector('a.video-card_videoCardLink_37D')
+                if not link:
+                    continue
+
+                url = link.get_attribute('href')
+                title = link.get_attribute('aria-label').replace('Open video: ', '')
+                
+                progress_queue.put(("status", f"Processing {i}/{len(videos)}: {title}"))
+                
+                if url not in existing_urls:
+                    append_to_excel(title, url, "")
+                    new_entries += 1
+
+            progress_queue.put(("status", f"Sync complete! Added {new_entries} new videos"))
+            
+        except Exception as e:
+            progress_queue.put(("error", f"Sync failed: {str(e)}"))
+        finally:
+            context.close()
+            shutil.rmtree(temp_profile_dir, ignore_errors=True)
+            
 def generate_embed_codes(progress_queue):
     max_retries = 3
     
@@ -698,6 +768,8 @@ def check_progress_queue(progress_queue):
                 _, text, value = item
                 progress_label.config(text=f"{text} ({value}%)")
                 progress_bar['value'] = value
+            elif item[0] == "status":
+                progress_label.config(text=item[1])
             elif item[0] == "remove_file":
                 filename = item[1]
                 all_items = upload_listbox.get(0, tk.END)
@@ -739,12 +811,15 @@ def check_progress_queue(progress_queue):
         pass
     root.after(100, lambda: check_progress_queue(progress_queue))
 
-
+def start_sync():
+    progress_queue = queue.Queue()
+    threading.Thread(target=sync_videos, args=(progress_queue,)).start()
+    root.after(100, lambda: check_progress_queue(progress_queue))
 
 
 root = tk.Tk()
 root.title("Loom Video Uploader")
-root.geometry("850x650")  # Wider window
+root.geometry("900x650")  # Wider window
 root.configure(bg='#f0f0f0')
 root.resizable(False, False)
 
@@ -776,7 +851,7 @@ service_file_entry.insert(0, config['service_file'])
 service_file_entry.grid(row=1, column=1, padx=5, sticky='ew')
 
 ttk.Label(input_frame, text="Space URL:").grid(row=2, column=0, padx=5, sticky='w')
-space_entry = ttk.Entry(input_frame, width=90)
+space_entry = ttk.Entry(input_frame, width=102)
 space_entry.insert(0, config['space'])
 space_entry.grid(row=2, column=1, padx=5, sticky='ew')
 
@@ -795,8 +870,9 @@ rename_button = ttk.Button(button_frame, text="Rename", command=rename_selected)
 upload_button = ttk.Button(button_frame, text="Upload", command=start_upload)
 pause_button = ttk.Button(button_frame, text="Pause", command=pause_upload)
 generate_button = ttk.Button(button_frame, text="Generate Embeds", command=start_generate_embeds)
+sync_button = ttk.Button(button_frame, text="Sync", command=lambda: start_sync())
 
-buttons = [login_button, logout_button, download_button, download_upload_button, rename_button, upload_button, pause_button, generate_button]
+buttons = [login_button, logout_button, download_button, download_upload_button, rename_button, upload_button, pause_button, generate_button,sync_button]
 for btn in buttons:
     btn.pack(side='left', padx=5)
 
