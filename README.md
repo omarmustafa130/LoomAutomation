@@ -100,9 +100,12 @@ Run the generated executable (`LoomAutomation.exe` on Windows or `./LoomAutomati
 | **Login** | Opens a browser where you manually log in to Loom. Saves login cookies for automation (You only have to do this at least once).|
 | **Logout** | Deletes stored login data (cookies) and configuration. |
 | **Download** | Downloads videos from your Google Drive folder. |
-| **Upload** | Uploads downloaded videos to Loom. |
+| **Upload** | Uploads downloaded videos to Loom and stores Title, URL, and Embed Code for each video uploaded. |
 | **Download & Upload** | Runs both Download and Upload processes automatically. |
 | **Rename Selected** | Allows renaming a selected video before uploading it. |
+| **Pause** | Pauses uploading videos. |
+| **Generate Embeds** | Generates Embed codes for the videos that don't have embed codes in teh excel sheet. |
+| **Sync** | Adds all the videos titles and URLs that are present in teh loom folder but not the excel sheet. |
 
 ### **Steps to Upload Videos**
 1. Specify Folder ID
@@ -146,5 +149,4 @@ Feel free to contribute by:
 
 ---
 
-
-🚀 **Enjoy automating your Google Drive to Loom workflow!** 🎥
+**Enjoy automating your Google Drive to Loom workflow!** 🎥
