@@ -111,7 +111,7 @@ Run the generated executable (`LoomAutomation.exe` on Windows or `./LoomAutomati
 1. Specify Folder ID
 2. Select the Google Service Account config file (Json)
 3. Specify the workspace URL (Loom Workspace on which you wish the videos to be uploaded)
-4. **Login** to Loom (Only if not already logged in from before).
+4. **Login** to Loom (Only if not already logged in from before) **Warning - Login first then click ok on the messagebox**.
 5. **Download** videos from Google Drive.
 6. Rename selected videos if needed (Optional)
 7. **Upload** them to Loom.
