@@ -152,7 +152,7 @@ def extract_embed_code(page, progress_queue, title):
         dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
         
         try:
-            page.wait_for_selector('img[alt="Video thumbnail"]', timeout=20000)
+            page.wait_for_selector('img[alt="Video thumbnail"]', timeout=5000)
         except:
             dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
             dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
@@ -240,12 +240,12 @@ def sync_videos(progress_queue):
             page.wait_for_selector('article[data-videoid]', timeout=30000)
 
             prev_count = 0
-            max_consecutive_no_new = 4
+            max_consecutive_no_new = 6
             consecutive_no_new = 0
 
             while consecutive_no_new < max_consecutive_no_new:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(6)  # Wait for content to load
+                time.sleep(8)  # Wait for content to load
                 current_videos = page.query_selector_all('article[data-videoid]')
                 current_count = len(current_videos)
                 progress_queue.put(("status", f"Loaded {current_count} videos..."))
@@ -269,16 +269,24 @@ def sync_videos(progress_queue):
             for i, video in enumerate(videos, 1):
                 link = video.query_selector('a.video-card_videoCardLink_37D')
                 if not link:
+                    print(f"Video {i}: No link found.")
                     continue
 
                 url = link.get_attribute('href')
-                title = link.get_attribute('aria-label').replace('Open video: ', '')
-                
-                progress_queue.put(("status", f"Processing {i}/{len(videos)}: {title}"))
-                
+                title_attr = link.get_attribute('aria-label')
+                if not url or not title_attr:
+                    print(f"Video {i}: Missing URL or title.")
+                    continue
+
+                title = title_attr.replace('Open video: ', '')
+                print(f"Video {i}: {title} - {url}")
+
                 if url not in existing_urls:
                     append_to_excel(title, url, "")
                     new_entries += 1
+                else:
+                    print(f"Video {i}: Duplicate URL.")
+
 
             progress_queue.put(("status", f"Sync complete! Added {new_entries} new videos"))
             
@@ -650,22 +658,40 @@ def upload_videos(progress_queue):
                     progress_queue.put(("upload", "Finished uploading. Extracting URL..", 0))
                     try:
                         time.sleep(5)
-                        video_url = page.url
-                        """
+                        
                         page.wait_for_selector(".uppy-Dashboard-Item.is-complete", timeout=processing_timeout)
                         video_link_element = page.wait_for_selector(
                             ".uppy-Dashboard-Item.is-complete .uppy-Dashboard-Item-previewLink",
                             timeout=processing_timeout
                         )
                         video_url = video_link_element.get_attribute("href")
-                        """
+                        
                     except TimeoutError as e:
                         append_to_excel(filename, "", "")
                         print(f"Timeout extracting URL for {filename}: {e}")
                         raise
-
-                    append_to_excel(filename, video_url, "")
-                    progress_queue.put(("add_video", filename, video_url, ""))
+                    
+                    try:
+                        # Check if the video URL is valid
+                        page.goto(video_url)
+                        page.wait_for_selector('button[data-testid="share-modal-button"]', timeout=20000).click()
+                        time.sleep(10)
+                        dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
+                        dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
+                        try:
+                            page.wait_for_selector('img[alt="Video thumbnail"]', timeout=5000)
+                        except:
+                            dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
+                            dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
+                        copy_btn = page.wait_for_selector('button.css-ask8uh:has-text("Copy embed code")', timeout=20000)
+                        copy_btn.click()
+                        embed_code = page.evaluate("navigator.clipboard.readText()")
+                        
+                    except:
+                        embed_code = ""
+                        
+                    append_to_excel(filename, video_url, embed_code)
+                    progress_queue.put(("add_video", filename, video_url, embed_code))
 
                     os.remove(file_path)
                     progress_queue.put(("remove_file", filename))
