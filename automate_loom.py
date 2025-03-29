@@ -16,7 +16,7 @@ import sys
 import shutil
 
 
-
+login_event = threading.Event() 
 PAUSE_FLAG = False
 excel_lock = threading.Lock()
 # Configuration constants
@@ -50,6 +50,46 @@ def save_config():
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f)
 
+# ---------------------------------------------------------------------------
+# WATCHDOG SECTION: Real-time folder scanning
+# ---------------------------------------------------------------------------
+def watch_download_folder():
+    """
+    Periodically check for new or removed files in the TEMPORARY_DOWNLOAD_DIR
+    and update the upload_listbox accordingly.
+    """
+    current_files = set(os.listdir(TEMPORARY_DOWNLOAD_DIR))
+    listbox_files = set(upload_listbox.get(0, tk.END))
+
+    # Find newly added files
+    newly_added = current_files - listbox_files
+    # Find removed files
+    removed = listbox_files - current_files
+
+    # Update the listbox for newly added files
+    for f in newly_added:
+        upload_listbox.insert(tk.END, f)
+
+    # Remove missing files from the listbox
+    if removed:
+        # We have to remove them by index, so iterate carefully
+        for fname in removed:
+            # Check again if it's still in the listbox (it should be)
+            items = upload_listbox.get(0, tk.END)
+            if fname in items:
+                idx = items.index(fname)
+                upload_listbox.delete(idx)
+
+    # Schedule this function to run again in 2 seconds
+    root.after(2000, watch_download_folder)
+# ---------------------------------------------------------------------------
+
+
+def start_watchdog():
+    """
+    Kick off the watch_download_folder function after the GUI is ready.
+    """
+    watch_download_folder()
 
 def append_to_excel(video_title, video_url, embed_code):
     file_name = "uploaded_videos.xlsx"
@@ -87,6 +127,10 @@ def update_excel_embed_code(video_url, new_embed_code):
 
 
 def login_and_save_cookies(progress_queue):
+    """
+    Launch Loom, wait for the user to log in, then capture cookies once the user
+    confirms via the main-thread messagebox.
+    """
     with sync_playwright() as p:
         temp_profile_dir = tempfile.mkdtemp()
         print(f"[LOGIN] Using profile at: {temp_profile_dir}")
@@ -96,23 +140,39 @@ def login_and_save_cookies(progress_queue):
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "--disable-dev-shm-usage"
             ]
         )
+
         page = context.new_page()
         page.evaluate("() => { delete window.navigator.webdriver; }")
         page.goto("https://www.loom.com/looms/videos")
-        progress_queue.put(("info", "Login Required", "Please login to Loom in the opened browser.\nPress OK here when done."))
-        # Wait for user to log in (this could be improved, e.g., with a manual signal)
-        time.sleep(10)
-        cookies = context.cookies()
-        print("[LOGIN] Cookies extracted. Saving to file loom_cookies.json.")
-        with open(LOOM_COOKIES_FILE, "w") as f:
-            json.dump(cookies, f, indent=2)
-        context.close()
-        progress_queue.put(("info", "Login Complete", "Cookies have been saved. You can close the browser now if it's still open."))
+        print('Site loaded')
+        # Ask the main thread to show a *blocking* messagebox
+        progress_queue.put(
+            ("ask_login_done", 
+             "Login Required", 
+             "Please log into Loom in the opened browser.\n\n"
+             "Press OK here when you're done logging in.")
+        )
 
+        print("[LOGIN] Waiting for user to confirm they're done logging in...")
+        # The background thread will block here until the main thread sets login_event
+        login_event.wait()
+
+        # Once user pressed OK, we gather cookies
+        cookies = context.cookies()
+        print("[LOGIN] Cookies extracted, saving to loom_cookies.json ...")
+        with open("loom_cookies.json", "w") as f:
+            json.dump(cookies, f, indent=2)
+
+        context.close()
+        shutil.rmtree(temp_profile_dir, ignore_errors=True)
+        progress_queue.put((
+            "info", 
+            "Login Complete", 
+            "Cookies have been saved. You can close the browser now if it's still open."
+        ))
 
 def logout():
     """Delete config and cookies file, then clear GUI entries."""
@@ -180,6 +240,7 @@ def process_video_url(url, progress_queue, title):
             temp_profile_dir,
             headless=True,
             args=[
+                "--dns-prefetch-disable",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -195,7 +256,8 @@ def process_video_url(url, progress_queue, title):
             # Possibly track how long it's taking...
             # You can add your own "stuck" logic similarly.
 
-            time.sleep(5)
+            time.sleep(10)
+            print('Site loaded')
             embed_code = extract_embed_code(page, progress_queue, title)
             return embed_code
         except Exception as e:
@@ -225,6 +287,7 @@ def sync_videos(progress_queue):
             temp_profile_dir,
             headless=True,
             args=[
+                "--dns-prefetch-disable",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -236,9 +299,10 @@ def sync_videos(progress_queue):
 
         try:
             progress_queue.put(("status", "Loading Loom space content..."))
-            page.goto(space_url)
-            page.wait_for_selector('article[data-videoid]', timeout=30000)
+            page.goto(space_url, wait_until="networkidle", timeout=120000)
 
+            page.wait_for_selector('article[data-videoid]', timeout=30000)
+            print('Site loaded')
             prev_count = 0
             max_consecutive_no_new = 6
             consecutive_no_new = 0
@@ -297,52 +361,43 @@ def sync_videos(progress_queue):
             shutil.rmtree(temp_profile_dir, ignore_errors=True)
             
 def generate_embed_codes(progress_queue):
-    max_retries = 3
-    
     try:
-        with excel_lock:
-            wb = load_workbook("uploaded_videos.xlsx")
-            ws = wb["Videos"]
-            rows_to_process = []
-            for row in ws.iter_rows(min_row=2):
-                title = row[0].value or ""
-                url   = row[1].value or ""
-                code  = row[2].value or ""
-                if not code or "Couldn't Extract" in code:
-                    rows_to_process.append((title, url))
-        
-        if not rows_to_process:
-            progress_queue.put(("complete", "All embed codes already present"))
-            return
-        
-        progress_queue.put(("total_embeds", len(rows_to_process)))
-        
-        for i, (title, url) in enumerate(rows_to_process, start=1):
-            progress_queue.put(("current_embed", i, url))
-            attempts_left = max_retries
-            embed_code = None
-            
-            while attempts_left > 0:
-                try:
-                    embed_code = process_video_url(url, progress_queue, title)
-                    if embed_code:
-                        break
-                except Exception as e:
-                    print(f"Embed extraction error for {url}: {e}")
-                attempts_left -= 1
-                if attempts_left > 0:
-                    print(f"Retrying embed extraction for {url}...")
-            
-            if embed_code:
-                update_excel_embed_code(url, embed_code)
-            else:
-                embed_code = "Couldn't Extract - Retry Failed"
-                update_excel_embed_code(url, embed_code)
-    
+        filename = "uploaded_videos.xlsx"
+        wb = load_workbook(filename)
+        ws = wb.active
+
+        headers = {cell.value: cell.column for cell in ws[1]}
+        url_col = headers.get("URL")
+        embed_col = headers.get("Embed Code")
+
+        if embed_col is None:
+            embed_col = ws.max_column + 1
+            ws.cell(row=1, column=embed_col, value="Embed Code")
+
+        def generate_embed_code(url):
+            if isinstance(url, str) and "/share/" in url:
+                video_id = url.split("/share/")[-1]
+                embed_url = f"https://www.loom.com/embed/{video_id}"
+                return (
+                    '<div style="position: relative; padding-bottom: 56.25%; height: 0;">'
+                    f'<iframe src="{embed_url}" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen '
+                    'style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe>'
+                    '</div>'
+                )
+            return ""
+
+        for row in range(2, ws.max_row + 1):
+            url = ws.cell(row=row, column=url_col).value
+            if not url:
+                continue
+            embed_code = generate_embed_code(url)
+            ws.cell(row=row, column=embed_col, value=embed_code)
+
+        wb.save(filename)
+        progress_queue.put(("complete", "Embed codes generated."))
+
     except Exception as e:
-        progress_queue.put(("embed_error", "General Error", str(e)))
-    finally:
-        progress_queue.put(("complete", "Embed code generation completed"))
+        progress_queue.put(("error", f"Embed code generation failed: {e}"))
 
 
 
@@ -492,7 +547,7 @@ def upload_videos(progress_queue):
     global PAUSE_FLAG
     PAUSE_FLAG = False
 
-    max_retries = 3
+    max_retries = 10
     upload_timeout_seconds = 180
     processing_timeout = 180000
     time_between_checks = 5
@@ -546,6 +601,7 @@ def upload_videos(progress_queue):
                         headless=True,
                         viewport={"width": 1280, "height": 720},
                         args=[
+                            "--dns-prefetch-disable",
                             "--disable-blink-features=AutomationControlled",
                             "--no-sandbox",
                             "--disable-dev-shm-usage",
@@ -562,9 +618,10 @@ def upload_videos(progress_queue):
 
                     progress_queue.put(("upload", f"Opening Loom workspace for {filename}...", 0))
                     space_url = space_entry.get().strip()
-                    page.goto(space_url)
-                    time.sleep(8)
+                    page.goto(space_url, wait_until="networkidle", timeout=120000)
 
+                    time.sleep(12)
+                    print('Site loaded')
                     # Click "Add video" button with timeout
                     try:
                         add_video_button = page.wait_for_selector('button:has-text("Add video")', timeout=60000)
@@ -671,27 +728,13 @@ def upload_videos(progress_queue):
                         print(f"Timeout extracting URL for {filename}: {e}")
                         raise
                     
-                    try:
-                        # Check if the video URL is valid
-                        page.goto(video_url)
-                        page.wait_for_selector('button[data-testid="share-modal-button"]', timeout=20000).click()
-                        time.sleep(10)
-                        dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
-                        dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
-                        try:
-                            page.wait_for_selector('img[alt="Video thumbnail"]', timeout=5000)
-                        except:
-                            dialog = page.locator("dialog.css-1gw7q29[role='dialog']")
-                            dialog.locator("button.menu_shareTab_3H-", has_text="Embed").click()
-                        copy_btn = page.wait_for_selector('button.css-ask8uh:has-text("Copy embed code")', timeout=20000)
-                        copy_btn.click()
-                        embed_code = page.evaluate("navigator.clipboard.readText()")
-                        
-                    except:
-                        embed_code = ""
-                        
-                    append_to_excel(filename, video_url, embed_code)
-                    progress_queue.put(("add_video", filename, video_url, embed_code))
+                    
+                    
+                    append_to_excel(filename, video_url, "")
+                    generate_embed_codes(progress_queue)
+
+                    progress_queue.put(("add_video", filename, video_url, ""))
+
 
                     os.remove(file_path)
                     progress_queue.put(("remove_file", filename))
@@ -705,6 +748,7 @@ def upload_videos(progress_queue):
                     print(f"TimeoutError for {filename}: {toe}. Attempts left: {attempts_left}")
                     context.close()
                     shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                    time.sleep(120)
                     if attempts_left == 0:
                         progress_queue.put(("warning", f"Skipped {filename} after {max_retries} failed attempts due to timeout."))
                         progress_queue.put(("upload", f"Skipped {filename} due to repeated timeouts", 0))
@@ -715,6 +759,7 @@ def upload_videos(progress_queue):
                     print(f"Unexpected error uploading {filename}: {e}")
                     context.close()
                     shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                    time.sleep(120)
                     if attempts_left == 0:
                         progress_queue.put(("error", f"Skipped {filename} after {max_retries} failed attempts due to error: {e}"))
                         progress_queue.put(("upload", f"Skipped {filename} due to repeated errors", 0))
@@ -734,13 +779,14 @@ def browse_file():
 
 # <--- NEW CODE: A "Login" button
 def start_login():
+    """
+    Launch a background thread that calls login_and_save_cookies.
+    """
     progress_queue = queue.Queue()
-    def run_login():
-        login_and_save_cookies(progress_queue)
-    t = threading.Thread(target=run_login)
+    t = threading.Thread(target=login_and_save_cookies, args=(progress_queue,))
     t.start()
     root.after(100, lambda: check_progress_queue(progress_queue))
-    
+
 # Download Videos button
 def start_download():
     folder_id = folder_id_entry.get().strip()
@@ -800,6 +846,11 @@ def check_progress_queue(progress_queue):
                 upload_listbox.delete(0, tk.END)
                 for fname in item[1]:
                     upload_listbox.insert(tk.END, fname)
+            elif item[0] == "ask_login_done":
+                # item[1] is the title, item[2] is the message
+                messagebox.showinfo(item[1], item[2])
+                # The user just clicked OK, so we set the event
+                login_event.set()
             elif item[0] == "add_video":
                 tree.insert("", "end", values=(item[1], item[2], item[3]))
             elif item[0] in ("download", "upload"):
@@ -839,7 +890,9 @@ def check_progress_queue(progress_queue):
             elif item[0] == "warning":
                 progress_queue.put("Warning", item[1])
             elif item[0] == "info":
-                progress_queue.put(item[1], item[2])
+                # Show the messagebox right here
+                # item[1] = title, item[2] = message
+                messagebox.showinfo(item[1], item[2])
             elif item[0] == "pausing":
                 progress_label.config(text="Upload paused")
                 progress_bar['value'] = 0
@@ -961,4 +1014,6 @@ tree.pack(side='left', fill='both', expand=True)
 tree_scroll.pack(side='right', fill='y')
 
 root.protocol("WM_DELETE_WINDOW", lambda: [save_config(), root.destroy()])
+root.after(1000, start_watchdog)  # Start the watchdog after 1 second
+
 root.mainloop()
