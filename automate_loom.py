@@ -324,10 +324,11 @@ def sync_videos(progress_queue):
             progress_queue.put(("status", f"Found {len(videos)} videos in space"))
 
             existing_urls = set()
-            if os.path.exists("uploaded_videos.xlsx"):
-                wb = load_workbook("uploaded_videos.xlsx")
-                ws = wb.active
-                existing_urls = {row[1].value for row in ws.iter_rows(min_row=2)}
+            with excel_lock:
+                if os.path.exists("uploaded_videos.xlsx"):
+                    wb = load_workbook("uploaded_videos.xlsx")
+                    ws = wb.active
+                    existing_urls = {row[1].value for row in ws.iter_rows(min_row=2)}
 
             new_entries = 0
             for i, video in enumerate(videos, 1):
@@ -361,43 +362,44 @@ def sync_videos(progress_queue):
             shutil.rmtree(temp_profile_dir, ignore_errors=True)
             
 def generate_embed_codes(progress_queue):
-    try:
-        filename = "uploaded_videos.xlsx"
-        wb = load_workbook(filename)
-        ws = wb.active
+    with excel_lock:
+        try:
+            filename = "uploaded_videos.xlsx"
+            wb = load_workbook(filename)
+            ws = wb.active
 
-        headers = {cell.value: cell.column for cell in ws[1]}
-        url_col = headers.get("URL")
-        embed_col = headers.get("Embed Code")
+            headers = {cell.value: cell.column for cell in ws[1]}
+            url_col = headers.get("URL")
+            embed_col = headers.get("Embed Code")
 
-        if embed_col is None:
-            embed_col = ws.max_column + 1
-            ws.cell(row=1, column=embed_col, value="Embed Code")
+            if embed_col is None:
+                embed_col = ws.max_column + 1
+                ws.cell(row=1, column=embed_col, value="Embed Code")
 
-        def generate_embed_code(url):
-            if isinstance(url, str) and "/share/" in url:
-                video_id = url.split("/share/")[-1]
-                embed_url = f"https://www.loom.com/embed/{video_id}"
-                return (
-                    '<div style="position: relative; padding-bottom: 56.25%; height: 0;">'
-                    f'<iframe src="{embed_url}" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen '
-                    'style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe>'
-                    '</div>'
-                )
-            return ""
+            def generate_embed_code(url):
+                if isinstance(url, str) and "/share/" in url:
+                    video_id = url.split("/share/")[-1]
+                    embed_url = f"https://www.loom.com/embed/{video_id}"
+                    return (
+                        '<div style="position: relative; padding-bottom: 56.25%; height: 0;">'
+                        f'<iframe src="{embed_url}" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen '
+                        'style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe>'
+                        '</div>'
+                    )
+                return ""
 
-        for row in range(2, ws.max_row + 1):
-            url = ws.cell(row=row, column=url_col).value
-            if not url:
-                continue
-            embed_code = generate_embed_code(url)
-            ws.cell(row=row, column=embed_col, value=embed_code)
+            for row in range(2, ws.max_row + 1):
+                url = ws.cell(row=row, column=url_col).value
+                if not url:
+                    continue
+                embed_code = generate_embed_code(url)
+                ws.cell(row=row, column=embed_col, value=embed_code)
 
-        wb.save(filename)
-        progress_queue.put(("complete", "Embed codes generated."))
+            wb.save(filename)
+            progress_queue.put(("complete", "Embed codes generated."))
 
-    except Exception as e:
-        progress_queue.put(("error", f"Embed code generation failed: {e}"))
+        except Exception as e:
+            progress_queue.put(("error", f"Embed code generation failed: {e}"))
 
 
 
